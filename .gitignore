@@ -1,0 +1,6 @@
+.build/
+PointFinder.app/
+.DS_Store
+.swiftpm/
+# Sample scans are kept locally, not published.
+Sample Image*/
