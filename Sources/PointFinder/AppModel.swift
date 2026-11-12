@@ -10,8 +10,19 @@ final class AppModel: ObservableObject {
     @Published var image: CGImage?
     @Published var points: [MapPoint] = []
     @Published var lines: [GridLine] = []
+    /// Long lines the last detection ruled out (frame, routes), for the second opinion to avoid.
+    private var rejectedLines: [[Vec2]] = []
     @Published var selection: Int?
-    @Published var addMode = false
+    @Published var addMode = false {
+        didSet { if addMode && regionMode { regionMode = false } }
+    }
+    /// While on, dragging on the map marks out an area to search again.
+    @Published var regionMode = false {
+        didSet {
+            if regionMode && addMode { addMode = false }
+            if regionMode { status = "Drag a rectangle over the area to search again. Esc cancels." }
+        }
+    }
     @Published var showLines = true
     @Published var showLabels = true
     @Published var status = "Open a map image to begin."
@@ -59,6 +70,7 @@ final class AppModel: ObservableObject {
             image = cg
             points = []
             lines = []
+            rejectedLines = []
             selection = nil
             solution = nil
             nextID = 1
@@ -117,14 +129,83 @@ final class AppModel: ObservableObject {
             nextID = (merged.map { $0.id }.max() ?? nextID) + 1
             points = merged
             lines = result.lines
+            rejectedLines = result.rejectedLines
             if let s = selection, !points.contains(where: { $0.id == s }) { selection = nil }
             if result.points.isEmpty {
                 status = "No graticule intersections found. Try the detection settings, or add points by hand."
             } else {
-                status = "Found \(result.points.count) intersections. Select two that are diagonal from each "
+                let inferred = result.points.filter { $0.inferred }.count
+                status = "Found \(result.points.count) intersections"
+                    + (inferred > 0 ? " (\(inferred) inferred from the lines, shown in red — check them)" : "")
+                    + ". Select two that are diagonal from each "
                     + "other, give each a longitude and latitude, then press Calculate."
                 hasUnsavedChanges = true
             }
+            recalculateQuietly()
+        }
+    }
+
+    // MARK: Second opinion
+
+    /// Searches one area of the map again, more leniently, for intersections the
+    /// grid of known points predicts there.
+    func secondOpinion(in region: PixelRect) {
+        guard let cg = image, busy == nil else { return }
+        let known = points.compactMap { p -> GridPoint? in
+            guard let c = p.col, let r = p.row else { return nil }
+            return GridPoint(x: p.x, y: p.y, col: c, row: r, quality: 1, inferred: p.inferred)
+        }
+        guard known.count >= 3 else {
+            status = "A second opinion needs the grid from Detect first: it works from the intersections already found."
+            NSSound.beep()
+            return
+        }
+        let completion = CompletionParams.secondOpinion(
+            region: region, detection: params, avoidLines: rejectedLines)
+        let ink = params.ink
+        busy = "Looking again at the selected area"
+        progress = 0.5
+        Task.detached(priority: .userInitiated) {
+            let outcome: Result<[GridPoint], Error>
+            do {
+                let gray = try grayImage(from: cg, ink: ink)
+                outcome = .success(completeGrid(gray: gray, known: known, params: completion))
+            } catch {
+                outcome = .failure(error)
+            }
+            await MainActor.run { self.finishSecondOpinion(outcome, for: cg) }
+        }
+    }
+
+    private func finishSecondOpinion(_ outcome: Result<[GridPoint], Error>, for cg: CGImage) {
+        busy = nil
+        guard cg === image else { return }
+        switch outcome {
+        case .failure(let error):
+            status = error.localizedDescription
+        case .success(let found):
+            // Leave alone any spot that already has a point (one added by hand, say).
+            let fresh = found.filter { g in
+                !points.contains { Vec2($0.x, $0.y).distance(to: Vec2(g.x, g.y)) < 6 }
+                    && !points.contains { $0.col == g.col && $0.row == g.row }
+            }
+            guard !fresh.isEmpty else {
+                status = "Second opinion: nothing new in that area."
+                return
+            }
+            for g in fresh {
+                var p = MapPoint(id: nextID, x: g.x, y: g.y, col: g.col, row: g.row)
+                p.inferred = g.inferred
+                nextID += 1
+                points.append(p)
+            }
+            lines.append(contentsOf: linesThrough(fresh.filter { !$0.inferred }))
+            hasUnsavedChanges = true
+            let inferred = fresh.filter { $0.inferred }.count, seen = fresh.count - inferred
+            var parts: [String] = []
+            if seen > 0 { parts.append("found \(seen) more intersection\(seen == 1 ? "" : "s")") }
+            if inferred > 0 { parts.append("placed \(inferred) inferred (red) where the image shows no clear crossing") }
+            status = "Second opinion: " + parts.joined(separator: " and ") + ". Check them against the map."
             recalculateQuietly()
         }
     }
@@ -201,6 +282,8 @@ final class AppModel: ObservableObject {
         guard let i = index(of: id), let image else { return }
         points[i].x = min(max(p.x, 0), Double(image.width))
         points[i].y = min(max(p.y, 0), Double(image.height))
+        // Once placed by hand it is no longer a guess.
+        points[i].inferred = false
         hasUnsavedChanges = true
     }
 

@@ -10,9 +10,9 @@ saves a `.points` file that the QGIS Georeferencer opens directly.
 Work in progress.
 
 - The detection, the coordinate solver and the `.points` reader/writer are
-  written and covered by tests (`swift test`, 20 tests).
+  written and covered by tests (`swift test`, 28 tests).
 - On the 5007 × 3328 sample atlas sheet (curved meridians and parallels, a book
-  gutter, heavy lettering) detection finds 61 intersections in under a second,
+  gutter, heavy lettering) detection finds 74 intersections (one of them inferred) in about a second,
   numbered consistently across both pages.
 - The app window compiles and packages, but **has not yet been seen running**:
   it was built in a session that could not open windows or take screenshots.
@@ -44,6 +44,9 @@ swift test                # run the tests
 5. **Save** (⌘S) writes the `.points` file. The default name is the image's
    full name plus `.points`, which is what QGIS looks for.
 
+Quitting with points that have coordinates but are not saved asks whether to
+save them first.
+
 Editing points:
 
 | Action | How |
@@ -59,6 +62,30 @@ after Calculate; type the true value or use Snap to Graticule.
 
 Marker colours: orange = no coordinate, blue = typed by you, green =
 calculated, purple = estimated, grey = switched off.
+
+A **red** marker is an inferred intersection: the image does not show a clean
+crossing there (lettering, a title box or dense linework is in the way), so the
+point was placed from the fitted lines or from its neighbours. It is numbered
+and calculated like any other grid point. Check its position; dragging or
+nudging it makes it an ordinary point, and giving it coordinates by hand turns
+it blue. Turn this off with "Infer hidden intersections from the lines" in the
+detection settings.
+
+### Second opinion on an area
+
+**Second Opinion** (⌘R) lets you drag a rectangle over part of the map where
+intersections are missing. That area is searched again using the grid already
+found: each empty grid position predicted to fall inside the rectangle is
+looked for in the image, more leniently than in the automatic pass, and one
+step beyond the outermost known lines. What it finds is added as ordinary
+points; a gap between known points that the image still does not confirm gets
+a red inferred point (if inference is on). It needs the grid from Detect, and
+uses every grid point on the map as context, inside the rectangle or not.
+
+Detection Settings ▸ "Guided search and second opinion" holds the controls for
+this and for the automatic guided search: on/off, search distance, how much of
+a line must show, second-opinion leniency, and whether a second opinion may add
+a line beyond the grid.
 
 ## Opening the result in QGIS
 
@@ -81,6 +108,23 @@ graticule lines choose Thin Plate Spline or a higher-order polynomial.
    full-resolution image by following both lines outward on all four sides.
 6. Number the lines from the spacing of their crossings, leaving a gap in the
    numbering where a line was missed.
+7. Guided search (optional, on by default). Every empty position in the
+   numbered grid is predicted from its neighbours along its row and its column,
+   from both sides and from each side alone, so that a line broken at the
+   gutter is followed from its own page. A crossing is accepted near the
+   predicted spot when both lines show on all four sides close up, carry on
+   over three times that distance, run in the expected directions, and are not
+   lines already ruled out (the frame, routes). New finds feed further
+   predictions. This is what recovers a parallel found on one page only, or a
+   meridian lost beside the gutter. It adds no new lines outside the grid; the
+   Second Opinion tool may.
+8. Fill in hidden crossings (optional, on by default). Where two found lines
+   cross but the crossing failed the check in step 5, the point is placed where
+   the fitted lines meet. Where a found line runs through a gap in a line of the
+   other family, the point is placed on the found line, spaced like its
+   neighbours along it; if the image then shows a clean crossing there it counts
+   as detected, otherwise it is marked inferred. Nothing is placed beyond the
+   ends of a line, or for a line that was not found at all.
 
 Because coordinates come from the grid numbering, not from pixel positions, the
 calculation is exact for any projection whose graticule is evenly spaced in
@@ -92,7 +136,14 @@ dark, and gently curved. Polar maps with circular parallels are not handled.
 ## Command line
 
 `swift run -c release pointfinder-cli <image> --overlay out.png` prints the
-intersections and draws what was found; `--help` lists the options.
+intersections and draws what was found; `--help` lists the options, including
+`--second-opinion x0,y0,x1,y1` to run the area search without the app.
+
+## Versions and license
+
+Versions are `1.<build>`: the build number goes up by one with each committed
+set of changes (`Sources/PointFinderCore/Version.swift`). Released under the
+MIT license; see `LICENSE`.
 
 ## Layout
 

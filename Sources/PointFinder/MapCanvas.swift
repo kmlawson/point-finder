@@ -135,6 +135,8 @@ private final class OverlayView: NSView {
     private var moved = false
     private var panning = false
     private var panOrigin = NSPoint.zero
+    /// Corners (view coordinates) of the area being dragged out for a second opinion.
+    private var regionDrag: (from: NSPoint, to: NSPoint)?
 
     private var model: AppModel? { canvas?.model }
 
@@ -142,13 +144,15 @@ private final class OverlayView: NSView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func resetCursorRects() {
-        if model?.addMode == true { addCursorRect(bounds, cursor: .crosshair) }
+        if model?.addMode == true || model?.regionMode == true { addCursorRect(bounds, cursor: .crosshair) }
     }
 
     // MARK: Drawing
 
     private func color(for p: MapPoint) -> NSColor {
         if !p.enabled { return NSColor(calibratedWhite: 0.55, alpha: 1) }
+        // Inferred intersections stand out until the user places or references them.
+        if p.inferred && p.source != .user { return NSColor(calibratedRed: 0.85, green: 0.1, blue: 0.15, alpha: 1) }
         switch p.source {
         case .user: return NSColor(calibratedRed: 0.0, green: 0.42, blue: 1.0, alpha: 1)
         case .calculated: return NSColor(calibratedRed: 0.0, green: 0.62, blue: 0.25, alpha: 1)
@@ -228,6 +232,22 @@ private final class OverlayView: NSView {
                 (text as NSString).draw(at: NSPoint(x: box.minX + 4, y: box.minY + 1), withAttributes: attributes)
             }
         }
+
+        if let drag = regionDrag {
+            let rect = NSRect(
+                x: min(drag.from.x, drag.to.x), y: min(drag.from.y, drag.to.y),
+                width: abs(drag.to.x - drag.from.x), height: abs(drag.to.y - drag.from.y))
+            NSColor(calibratedRed: 0.0, green: 0.42, blue: 1.0, alpha: 0.12).setFill()
+            rect.fill()
+            let outline = NSBezierPath(rect: rect)
+            NSColor.white.setStroke()
+            outline.lineWidth = 3
+            outline.stroke()
+            NSColor(calibratedRed: 0.0, green: 0.42, blue: 1.0, alpha: 1).setStroke()
+            outline.lineWidth = 1.5
+            outline.setLineDash([6, 4], count: 2, phase: 0)
+            outline.stroke()
+        }
     }
 
     // MARK: Mouse
@@ -251,7 +271,10 @@ private final class OverlayView: NSView {
         moved = false
         dragPoint = nil
         panning = false
-        if let hit = hitPoint(q) {
+        regionDrag = nil
+        if model.regionMode {
+            regionDrag = (q, q)
+        } else if let hit = hitPoint(q) {
             model.selection = hit.id
             dragPoint = hit.id
             let v = canvas.viewPoint(for: Vec2(hit.x, hit.y))
@@ -270,7 +293,10 @@ private final class OverlayView: NSView {
         let q = convert(event.locationInWindow, from: nil)
         if !moved && hypot(q.x - mouseDownAt.x, q.y - mouseDownAt.y) < 3 { return }
         moved = true
-        if let id = dragPoint {
+        if regionDrag != nil {
+            regionDrag?.to = q
+            needsDisplay = true
+        } else if let id = dragPoint {
             model.move(id: id, to: canvas.imagePoint(forView: NSPoint(x: q.x + dragOffset.x, y: q.y + dragOffset.y)))
         } else if panning {
             let scale = canvas.scrollView.magnification
@@ -284,6 +310,16 @@ private final class OverlayView: NSView {
 
     override func mouseUp(with event: NSEvent) {
         guard let model else { return }
+        if let drag = regionDrag {
+            regionDrag = nil
+            needsDisplay = true
+            if let canvas, abs(drag.to.x - drag.from.x) >= 8, abs(drag.to.y - drag.from.y) >= 8 {
+                let a = canvas.imagePoint(forView: drag.from), b = canvas.imagePoint(forView: drag.to)
+                model.regionMode = false
+                model.secondOpinion(in: PixelRect(minX: a.x, minY: a.y, maxX: b.x, maxY: b.y))
+            }
+            return
+        }
         if let id = dragPoint, moved { model.finishedMoving(id: id) }
         if panning && !moved { model.selection = nil }
         dragPoint = nil
@@ -328,7 +364,15 @@ private final class OverlayView: NSView {
         case 126: nudge(0, -1)
         case 36, 76: if model.selection != nil { model.editRequest += 1 }  // return, enter
         case 53:  // escape
-            if model.addMode { model.addMode = false } else { model.selection = nil }
+            if model.regionMode {
+                regionDrag = nil
+                model.regionMode = false
+                needsDisplay = true
+            } else if model.addMode {
+                model.addMode = false
+            } else {
+                model.selection = nil
+            }
         default: super.keyDown(with: event)
         }
     }

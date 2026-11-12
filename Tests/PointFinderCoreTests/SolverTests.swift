@@ -174,4 +174,13 @@ final class SolverTests: XCTestCase {
         XCTAssertTrue(merged.contains { $0.id == 4 && !$0.isGridPoint && $0.lon == 91 })
         XCTAssertFalse(merged.contains { $0.id == 5 })
     }
+
+    func testDetectionCarriesTheInferredMark() {
+        let detected = [
+            GridPoint(x: 10, y: 10, col: 0, row: 0, quality: 1),
+            GridPoint(x: 50, y: 10, col: 1, row: 0, quality: 0, inferred: true),
+        ]
+        let merged = mergeDetection(existing: [], detected: detected, nextID: 1)
+        XCTAssertEqual(merged.map { $0.inferred }, [false, true])
+    }
 }

@@ -14,6 +14,22 @@ public struct DetectionParams: Sendable {
     public var minLineFraction = 0.25
     /// Fraction of each of a crossing's four arms that must show a line.
     public var minArm = 0.4
+    /// Also mark crossings the image does not confirm: where two found lines
+    /// cross under lettering or a blot, and where a found line passes through a
+    /// gap in another. These points are flagged `inferred`.
+    public var inferMissing = true
+    /// After the lines are numbered, look for crossings they predict but the
+    /// line search missed (a line found on one page only, a short or broken line).
+    public var searchMissing = true
+    /// How far from the predicted place that search may accept a crossing, as a
+    /// fraction of the grid spacing there.
+    public var searchFraction = 0.12
+    /// Fraction of each line that the search must see over a long stretch.
+    public var searchMinLine = 0.5
+    /// Second opinion: how much more lenient than the automatic search (0 = the same, 1 = most).
+    public var secondOpinionLeniency = 0.5
+    /// Second opinion: may add a line one step outside the known grid.
+    public var secondOpinionNewLines = true
 
     /// Keep the line mask in the result (diagnostics only).
     public var keepDebugMask = false
@@ -32,6 +48,18 @@ public struct GridPoint: Sendable, Equatable {
     public var row: Int
     /// Weakest arm of the crossing, 0...1.
     public var quality: Double
+    /// True when the position comes from the fitted lines rather than from a
+    /// crossing seen in the image.
+    public var inferred = false
+
+    public init(x: Double, y: Double, col: Int, row: Int, quality: Double, inferred: Bool = false) {
+        self.x = x
+        self.y = y
+        self.col = col
+        self.row = row
+        self.quality = quality
+        self.inferred = inferred
+    }
 }
 
 public struct GridLine: Sendable {
@@ -46,6 +74,10 @@ public struct DetectionResult: Sendable {
     public var lines: [GridLine] = []
     /// Every long line found before graticule filtering, for diagnostics.
     public var candidateLines: [[Vec2]] = []
+    /// Long lines judged not to be part of the graticule (the frame, borders,
+    /// routes). A later search must not take a crossing with one of these for a
+    /// graticule crossing.
+    public var rejectedLines: [[Vec2]] = []
     public var segmentCount = 0
     /// Diagnostics: tile segments, crossings that failed the arm test, and the
     /// lines dropped for crossing others of their own family.
@@ -217,6 +249,7 @@ public func detectGraticule(
         var a: Int, b: Int  // chain indices: family 0, family 1
         var estimate: Vec2
         var dirA: Vec2, dirB: Vec2
+        var tA: Double, tB: Double  // position along each chain's axis
         var point = Vec2(0, 0)
         var quality = 0.0
         var accepted = false
@@ -230,7 +263,8 @@ public func detectGraticule(
                     || hit.point.y > Double(work.height - 1) { continue }
                 crossings.append(Crossing(
                     a: a, b: b, estimate: hit.point,
-                    dirA: ca.tangent(hit.tSelf), dirB: cb.tangent(hit.tOther)))
+                    dirA: ca.tangent(hit.tSelf), dirB: cb.tangent(hit.tOther),
+                    tA: hit.tSelf, tB: hit.tOther))
             }
         }
     }
@@ -343,6 +377,106 @@ public func detectGraticule(
         let col = columnFamily == 0 ? ia : ib, row = columnFamily == 0 ? ib : ia
         if !seen.insert([col, row]).inserted { continue }
         result.points.append(GridPoint(x: c.point.x, y: c.point.y, col: col, row: row, quality: c.quality))
+    }
+
+    for (i, c) in chains.enumerated() {
+        let numbered = alive[i] && slot[c.group].flatMap { index[familyOf[i]][$0] } != nil
+        if !numbered { result.rejectedLines.append(polyline(c.curve)) }
+    }
+
+    if params.searchMissing {
+        progress?("Looking for missed crossings", 0.96)
+        var completion = CompletionParams()
+        completion.contrast = params.contrast
+        completion.minArm = params.minArm
+        completion.searchFraction = params.searchFraction
+        completion.minLine = params.searchMinLine
+        completion.avoidLines = result.rejectedLines
+        let extra = completeGrid(gray: gray, known: result.points, params: completion)
+        for p in extra { seen.insert([p.col, p.row]) }
+        result.points.append(contentsOf: extra)
+        result.lines.append(contentsOf: linesThrough(extra))
+    }
+
+    if params.inferMissing {
+        func lineIndex(_ chain: Int) -> Int? {
+            slot[chains[chain].group].flatMap { index[familyOf[chain]][$0] }
+        }
+        /// Grid cell of a family-0 line number and a family-1 line number.
+        func cell(_ i0: Int, _ i1: Int) -> [Int] { columnFamily == 0 ? [i0, i1] : [i1, i0] }
+
+        // Two found lines cross, but the crossing itself is hidden.
+        // Only inside the stretch where both lines were actually seen: beyond a
+        // line's end there may be no map (the frame, a title box).
+        let slack = 4.0
+        for c in crossings where !c.accepted && alive[c.a] && alive[c.b] {
+            let ca = chains[c.a].curve, cb = chains[c.b].curve
+            if c.tA < ca.tMin - slack || c.tA > ca.tMax + slack || c.tB < cb.tMin - slack
+                || c.tB > cb.tMax + slack { continue }
+            guard let ia = lineIndex(c.a), let ib = lineIndex(c.b) else { continue }
+            let key = cell(ia, ib)
+            if !seen.insert(key).inserted { continue }
+            let p = fullPoint(c.estimate)
+            result.points.append(GridPoint(x: p.x, y: p.y, col: key[0], row: key[1], quality: 0, inferred: true))
+        }
+
+        // A found line runs through a gap in a line of the other family. The
+        // crossing lies on the found line, spaced like its neighbours along it.
+        for i in 0..<chains.count where alive[i] {
+            guard let own = lineIndex(i) else { continue }
+            let f = familyOf[i]
+            let curve = chains[i].curve
+            var tAt: [Int: Double] = [:]
+            for c in accepted {
+                if f == 0, c.a == i, let k = lineIndex(c.b) { tAt[k] = c.tA }
+                if f == 1, c.b == i, let k = lineIndex(c.a) { tAt[k] = c.tB }
+            }
+            guard let low = tAt.keys.min(), let high = tAt.keys.max(), high - low >= 2 else { continue }
+            for k in (low + 1)..<high where tAt[k] == nil {
+                let key = f == 0 ? cell(own, k) : cell(k, own)
+                if seen.contains(key) { continue }
+                // The other line must exist somewhere; take its direction from the nearest piece.
+                var otherDir: Vec2? = nil
+                let near = tAt.sorted { (abs($0.key - k), $0.key) < (abs($1.key - k), $1.key) }.prefix(4)
+                let features = near.map { n -> [Double] in
+                    let x = Double(n.key - k)
+                    return near.count >= 3 ? [1, x, x * x] : [1, x]
+                }
+                guard let fit = leastSquares(features: features, targets: near.map { $0.value }) else { continue }
+                let t = fit[0]
+                if t < curve.tMin || t > curve.tMax { continue }
+                let estimate = curve.point(t)
+                if estimate.x < 0 || estimate.y < 0 || estimate.x > Double(work.width - 1)
+                    || estimate.y > Double(work.height - 1) { continue }
+                var bestDistance = Double.infinity
+                for j in 0..<chains.count where alive[j] && familyOf[j] != f && lineIndex(j) == k {
+                    let cj = chains[j].curve
+                    let tj = min(cj.tMax, max(cj.tMin, cj.project(estimate).t))
+                    let d = cj.point(tj).distance(to: estimate)
+                    if d < bestDistance {
+                        bestDistance = d
+                        otherDir = cj.tangent(tj)
+                    }
+                }
+                guard let otherDir else { continue }
+                seen.insert(key)
+                var p = fullPoint(estimate)
+                var quality = 0.0, inferred = true
+                // If the image does show a clean crossing here after all, use it.
+                let est = Vec2((estimate.x + 0.5) * toFull - 0.5, (estimate.y + 0.5) * toFull - 0.5)
+                if let r = refineCrossing(
+                    gray: gray, estimate: est, dirA: curve.tangent(t), dirB: otherDir,
+                    reach: reach, unit: unit, minContrast: Double(params.contrast)),
+                    let weakest = r.arms.min(), weakest >= params.minArm
+                {
+                    p = Vec2(r.point.x + 0.5, r.point.y + 0.5)
+                    quality = weakest
+                    inferred = false
+                }
+                result.points.append(
+                    GridPoint(x: p.x, y: p.y, col: key[0], row: key[1], quality: quality, inferred: inferred))
+            }
+        }
     }
     result.points.sort { ($0.row, $0.col) < ($1.row, $1.col) }
     for (i, c) in chains.enumerated() where alive[i] {

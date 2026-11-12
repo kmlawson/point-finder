@@ -14,6 +14,10 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
 fi
 
 cd "$(dirname "$0")/.."
+# Version numbers live in Version.swift: version = MAJOR.BUILD.
+VERSION_FILE="Sources/PointFinderCore/Version.swift"
+MAJOR=$(awk '/static let major = [0-9]+/ { print $NF }' "$VERSION_FILE")
+BUILD=$(awk '/static let build = [0-9]+/ { print $NF }' "$VERSION_FILE")
 swift build -c release --product PointFinder
 
 APP="PointFinder.app"
@@ -21,7 +25,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 /bin/cp -f ".build/release/PointFinder" "$APP/Contents/MacOS/PointFinder"
 
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -31,8 +35,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleIdentifier</key><string>local.pointfinder</string>
     <key>CFBundleExecutable</key><string>PointFinder</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>0.1.0</string>
-    <key>CFBundleVersion</key><string>1</string>
+    <key>CFBundleShortVersionString</key><string>${MAJOR}.${BUILD}</string>
+    <key>CFBundleVersion</key><string>${BUILD}</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSPrincipalClass</key><string>NSApplication</string>
@@ -51,4 +55,4 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 PLIST
 
 codesign --force --sign - "$APP" >/dev/null 2>&1 || echo "Note: ad-hoc signing failed; the app still runs locally."
-echo "Built $(pwd)/$APP"
+echo "Built $(pwd)/$APP (version ${MAJOR}.${BUILD})"

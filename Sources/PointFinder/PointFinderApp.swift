@@ -2,8 +2,38 @@ import AppKit
 import PointFinderCore
 import SwiftUI
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    weak var model: AppModel?
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    /// Offers to save control points that have not been written to a file.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let model, model.hasUnsavedChanges, model.savableCount > 0,
+              ProcessInfo.processInfo.environment["PF_SNAPSHOT_DIR"] == nil else { return .terminateNow }
+        // After the window has been closed there is nothing to go back to, so no Cancel.
+        let canCancel = sender.windows.contains { $0.isVisible && $0.canBecomeMain }
+        let alert = NSAlert()
+        alert.messageText = "Save the control points before quitting?"
+        alert.informativeText = "\(model.savableCount) point\(model.savableCount == 1 ? " has" : "s have") "
+            + "coordinates that are not saved. They will be lost if you don't save them."
+        alert.addButton(withTitle: "Save")
+        if canCancel { alert.addButton(withTitle: "Cancel") }
+        let discard = alert.addButton(withTitle: "Don't Save")
+        discard.hasDestructiveAction = true
+        while true {
+            let answer = alert.runModal()
+            if answer == .alertFirstButtonReturn {
+                model.save()
+                // Still unsaved: the save panel was cancelled or the write failed.
+                if !model.hasUnsavedChanges { return .terminateNow }
+                if canCancel { return .terminateCancel }
+                continue
+            }
+            return canCancel && answer == .alertSecondButtonReturn ? .terminateCancel : .terminateNow
+        }
+    }
 }
 
 @main
@@ -18,7 +48,10 @@ struct PointFinderApp: App {
                 .frame(minWidth: 900, minHeight: 560)
                 // Files dropped on the app icon, or chosen with Open With, arrive here.
                 .onOpenURL { model.open($0) }
-                .onAppear { SelfCheck.runIfRequested(model: model) }
+                .onAppear {
+                    delegate.model = model
+                    SelfCheck.runIfRequested(model: model)
+                }
         }
         .handlesExternalEvents(matching: ["*"])
         .commands {
@@ -41,6 +74,9 @@ struct PointFinderApp: App {
                     .keyboardShortcut("k")
                     .disabled(model.referenceCount < 2)
                 Divider()
+                Toggle("Second Opinion on an Area", isOn: $model.regionMode)
+                    .keyboardShortcut("r")
+                    .disabled(model.image == nil || model.busy != nil || !model.hasGrid)
                 Toggle("Add Points", isOn: $model.addMode).keyboardShortcut("a", modifiers: [.command, .shift])
                 Button("Delete Selected Point") { model.deleteSelected() }.disabled(model.selection == nil)
                 Divider()

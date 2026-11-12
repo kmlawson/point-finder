@@ -81,6 +81,9 @@ struct ContentView: View {
                 .help("Adjust how lines are detected")
                 .disabled(model.image == nil)
                 .popover(isPresented: $showSettings, arrowEdge: .bottom) { DetectionSettings() }
+            Toggle(isOn: $model.regionMode) { Label("Second Opinion", systemImage: "rectangle.dashed") }
+                .help("Drag a rectangle on the map to search that area again for missed intersections")
+                .disabled(model.image == nil || model.busy != nil || !model.hasGrid)
             Toggle(isOn: $model.addMode) { Label("Add Points", systemImage: "plus.viewfinder") }
                 .help("Click the map to add a point (or Option-click at any time)")
                 .disabled(model.image == nil)
@@ -106,6 +109,7 @@ struct ContentView: View {
 
 private struct DetectionSettings: View {
     @EnvironmentObject var model: AppModel
+    @State private var showSearchSettings = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -128,6 +132,50 @@ private struct DetectionSettings: View {
                 "Black ink only (ignore coloured lines)",
                 isOn: Binding(
                     get: { model.params.ink == .blackOnly }, set: { model.params.ink = $0 ? .blackOnly : .anyDark }))
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle("Infer hidden intersections from the lines", isOn: $model.params.inferMissing)
+                Text("Adds a red point where two found lines cross under lettering, where one runs "
+                    + "through a gap in the other, or (second opinion) in a gap between known "
+                    + "points. Check these against the map.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Divider()
+            DisclosureGroup("Guided search and second opinion", isExpanded: $showSearchSettings) {
+                VStack(alignment: .leading, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Toggle("Search where the grid predicts a crossing", isOn: $model.params.searchMissing)
+                        Text("After the lines are numbered, looks for crossings they imply but the line "
+                            + "search missed: a line found on one page only, or a short or broken line.")
+                            .font(.caption).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Search distance: \(Int((model.params.searchFraction * 100).rounded()))% of the grid spacing")
+                        Slider(value: $model.params.searchFraction, in: 0.04...0.3)
+                        Text("How far from the predicted spot a crossing may be. Raise it for pages that "
+                            + "have slipped a long way at the gutter; lower it if wrong lines are picked up.")
+                            .font(.caption).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Line must show along: \(Int((model.params.searchMinLine * 100).rounded()))% of its length")
+                        Slider(value: $model.params.searchMinLine, in: 0.25...0.9)
+                        Text("Lower accepts lines broken by lettering; higher rejects more look-alikes.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Second opinion leniency: \(Int((model.params.secondOpinionLeniency * 100).rounded()))%")
+                        Slider(value: $model.params.secondOpinionLeniency, in: 0...1)
+                        Text("How much fainter, more broken and further from the predicted spot a crossing "
+                            + "may be when you ask for a second opinion on an area.")
+                            .font(.caption).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Toggle("Second opinion may add a line beyond the grid", isOn: $model.params.secondOpinionNewLines)
+                    }
+                }
+                .padding(.top, 8)
+            }
             HStack {
                 Button("Defaults") { model.params = DetectionParams() }
                 Spacer()
@@ -166,6 +214,7 @@ private func sourceName(_ p: MapPoint) -> String {
 
 private func sourceColor(_ p: MapPoint) -> Color {
     if !p.enabled { return .gray }
+    if p.inferred && p.source != .user { return Color(red: 0.85, green: 0.1, blue: 0.15) }
     switch p.source {
     case .user: return Color(red: 0, green: 0.42, blue: 1)
     case .calculated: return Color(red: 0, green: 0.62, blue: 0.25)
@@ -191,7 +240,8 @@ private struct Inspector: View {
                     Image(systemName: p.isGridPoint ? "circle" : "square")
                         .foregroundStyle(sourceColor(p))
                         .fontWeight(.bold)
-                    Text(p.isGridPoint ? "Detected intersection" : "Added point").font(.headline)
+                    Text(p.isGridPoint ? (p.inferred ? "Inferred intersection" : "Detected intersection") : "Added point")
+                        .font(.headline)
                     Spacer()
                     Button(role: .destructive) { model.delete(id: p.id) } label: { Image(systemName: "trash") }
                         .help("Delete this point (Delete key)")

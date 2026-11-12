@@ -7,7 +7,10 @@ final class DetectionTests: XCTestCase {
     /// Draws a conic graticule (converging meridians, arcs for parallels) inside
     /// a frame, with some stray strokes, and returns it with the true crossings.
     /// `interior` counts the crossings far enough inside the frame that all four arms exist.
-    private func syntheticMap() -> (image: GrayImage, truth: [(lon: Int, lat: Int, p: Vec2)], interior: Int) {
+    /// `erase` lists rectangles (image pixels) wiped back to paper after drawing.
+    private func syntheticMap(erase: [CGRect] = []) -> (
+        image: GrayImage, truth: [(lon: Int, lat: Int, p: Vec2)], interior: Int
+    ) {
         let w = 1600, h = 1100
         var data = [UInt8](repeating: 0, count: w * h)
         let apex = Vec2(800, -1500)
@@ -53,6 +56,8 @@ final class DetectionTests: XCTestCase {
             ctx.addLine(to: CGPoint(x: 1500, y: 700))
             ctx.strokePath()
             ctx.restoreGState()
+            ctx.setFillColor(gray: 0.92, alpha: 1)
+            for r in erase { ctx.fill(r) }
             for m in 0..<8 {
                 for k in 0..<6 {
                     let a = (-21 + 6 * Double(m)) * .pi / 180, r = 1650 + 170 * Double(k)
@@ -74,7 +79,8 @@ final class DetectionTests: XCTestCase {
         var matched: [(point: GridPoint, lon: Int, lat: Int)] = []
         for p in result.points {
             let nearest = truth.min { $0.p.distance(to: Vec2(p.x, p.y)) < $1.p.distance(to: Vec2(p.x, p.y)) }!
-            XCTAssertLessThan(nearest.p.distance(to: Vec2(p.x, p.y)), 0.75, "point at \(p.x),\(p.y)")
+            XCTAssertLessThan(
+                nearest.p.distance(to: Vec2(p.x, p.y)), p.inferred ? 3 : 0.75, "point at \(p.x),\(p.y)")
             matched.append((p, nearest.lon, nearest.lat))
         }
         XCTAssertEqual(Set(matched.map { [$0.lon, $0.lat] }).count, matched.count)
@@ -85,6 +91,54 @@ final class DetectionTests: XCTestCase {
             XCTAssertEqual(m.point.col - first.point.col, m.lon - first.lon)
             XCTAssertEqual(m.point.row - first.point.row, m.lat - first.lat)
         }
+    }
+
+    /// The detected point nearest to a true crossing, with its distance from it.
+    private func nearest(_ result: DetectionResult, to p: Vec2) -> (point: GridPoint, distance: Double)? {
+        result.points.map { ($0, p.distance(to: Vec2($0.x, $0.y))) }.min { $0.1 < $1.1 }
+    }
+
+    func testInfersACrossingHiddenUnderABlot() throws {
+        // Meridian 3 and parallel 2 cross at about (696, 487); wipe the crossing out.
+        let (image, truth, _) = syntheticMap(erase: [CGRect(x: 661, y: 452, width: 70, height: 70)])
+        let target = try XCTUnwrap(truth.first { $0.lon == 3 && $0.lat == 2 })
+        let neighbour = try XCTUnwrap(truth.first { $0.lon == 4 && $0.lat == 3 })
+
+        var off = DetectionParams()
+        off.inferMissing = false
+        let without = detectGraticule(gray: image, params: off)
+        XCTAssertGreaterThan(try XCTUnwrap(nearest(without, to: target.p)).distance, 50)
+        XCTAssertFalse(without.points.contains { $0.inferred })
+
+        let with = detectGraticule(gray: image)
+        let found = try XCTUnwrap(nearest(with, to: target.p))
+        XCTAssertLessThan(found.distance, 2.5)
+        XCTAssertTrue(found.point.inferred)
+        // It is numbered as part of the grid.
+        let other = try XCTUnwrap(nearest(with, to: neighbour.p))
+        XCTAssertLessThan(other.distance, 0.75)
+        XCTAssertFalse(other.point.inferred)
+        XCTAssertEqual(other.point.col - found.point.col, 1)
+        XCTAssertEqual(other.point.row - found.point.row, 1)
+        XCTAssertEqual(with.points.count, without.points.count + 1)
+    }
+
+    func testInfersCrossingsAlongALineWhereTheOtherLineIsBroken() throws {
+        // Wipe out 600 px of parallel 2, too long a gap for the two ends to be joined
+        // into one line. Meridians 2, 3 and 4 still run through the gap.
+        let (image, truth, _) = syntheticMap(erase: [CGRect(x: 400, y: 440, width: 600, height: 62)])
+        let result = detectGraticule(gray: image)
+        let anchor = try XCTUnwrap(nearest(result, to: try XCTUnwrap(truth.first { $0.lon == 3 && $0.lat == 3 }).p))
+        XCTAssertLessThan(anchor.distance, 0.75)
+        for lon in 2...4 {
+            let target = try XCTUnwrap(truth.first { $0.lon == lon && $0.lat == 2 })
+            let found = try XCTUnwrap(nearest(result, to: target.p))
+            XCTAssertLessThan(found.distance, 3, "meridian \(lon)")
+            XCTAssertTrue(found.point.inferred, "meridian \(lon)")
+            XCTAssertEqual(found.point.col - anchor.point.col, lon - 3)
+            XCTAssertEqual(found.point.row - anchor.point.row, -1)
+        }
+        XCTAssertEqual(Set(result.points.map { [$0.col, $0.row] }).count, result.points.count)
     }
 
     func testIndicesLeaveAGapForAMissedLine() {
