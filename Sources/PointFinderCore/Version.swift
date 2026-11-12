@@ -3,6 +3,6 @@
 /// `scripts/build-app.sh` reads both numbers from this file.
 public enum AppVersion {
     public static let major = 1
-    public static let build = 1
+    public static let build = 2
     public static var string: String { "\(major).\(build)" }
 }

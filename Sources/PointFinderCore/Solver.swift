@@ -25,6 +25,10 @@ public struct MapPoint: Identifiable, Equatable, Sendable {
     public var enabled = true
     /// A grid point placed from the fitted lines, not from a crossing seen in the image.
     public var inferred = false
+    /// How clearly the detector saw the crossing, 0...1; nil for points it did not find.
+    public var quality: Double?
+    /// The user has looked at this point in review and accepted it.
+    public var reviewed = false
 
     public init(id: Int, x: Double, y: Double, col: Int? = nil, row: Int? = nil) {
         self.id = id
@@ -241,6 +245,7 @@ public func mergeDetection(existing: [MapPoint], detected: [GridPoint], nextID: 
     for g in detected {
         var p = MapPoint(id: id, x: g.x, y: g.y, col: g.col, row: g.row)
         p.inferred = g.inferred
+        p.quality = g.quality
         id += 1
         if let k = kept.indices.min(by: {
             Vec2(kept[$0].x, kept[$0].y).distance(to: Vec2(g.x, g.y))

@@ -9,9 +9,15 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 0) {
             HSplitView {
-                ZStack {
-                    MapCanvas(model: model)
-                    if model.image == nil { emptyState }
+                VStack(spacing: 0) {
+                    ZStack {
+                        MapCanvas(model: model)
+                        if model.image == nil { emptyState }
+                    }
+                    if model.reviewing {
+                        Divider()
+                        ReviewBar()
+                    }
                 }
                 .frame(minWidth: 480, maxWidth: .infinity, maxHeight: .infinity)
                 Sidebar()
@@ -84,9 +90,19 @@ struct ContentView: View {
             Toggle(isOn: $model.regionMode) { Label("Second Opinion", systemImage: "rectangle.dashed") }
                 .help("Drag a rectangle on the map to search that area again for missed intersections")
                 .disabled(model.image == nil || model.busy != nil || !model.hasGrid)
+            Button {
+                if model.reviewing { model.endReview() } else { model.startReview() }
+            } label: {
+                Label(model.reviewing ? "Stop Review" : "Review", systemImage: "checklist")
+            }
+            .help("Step through the inferred and low-confidence points one at a time (⇧⌘R)")
+            .disabled(model.image == nil || !model.hasGrid)
             Toggle(isOn: $model.addMode) { Label("Add Points", systemImage: "plus.viewfinder") }
                 .help("Click the map to add a point (or Option-click at any time)")
                 .disabled(model.image == nil)
+            Button { model.readMarginLabels() } label: { Label("Read Labels", systemImage: "text.viewfinder") }
+                .help("Read the degree numbers in the margins and propose the grid's coordinates (⌘L)")
+                .disabled(model.image == nil || model.busy != nil || !model.hasGrid)
             Button { model.calculate() } label: { Label("Calculate", systemImage: "function") }
                 .help("Work out every other point from your reference points (⌘K)")
                 .disabled(model.referenceCount < 2)
@@ -100,6 +116,9 @@ struct ContentView: View {
                 Toggle("Coordinate Labels", isOn: $model.showLabels)
                 Divider()
                 Button("Zoom to Fit") { model.fitRequest += 1 }
+                Button("Zoom to Selection") { model.zoomToSelection() }.disabled(model.selection == nil)
+                Divider()
+                Button("Guess Projection…") { model.guessProjectionNow() }.disabled(!model.hasGrid)
             } label: {
                 Label("View", systemImage: "eye")
             }
@@ -113,6 +132,18 @@ private struct DetectionSettings: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 4) {
+                Picker("Graticule", selection: $model.params.style) {
+                    Text("Lines across the map").tag(GraticuleStyle.lines)
+                    Text("Ticks on the frame only").tag(GraticuleStyle.ticks)
+                }
+                if model.params.style == .ticks {
+                    Text("Joins each tick to the one opposite with a straight line and marks where the lines "
+                        + "cross. Right for maps with straight meridians and parallels; approximate otherwise.")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
             VStack(alignment: .leading, spacing: 4) {
                 Text("Line contrast: \(model.params.contrast)")
                 Slider(
@@ -247,7 +278,8 @@ private struct Inspector: View {
                         .help("Delete this point (Delete key)")
                 }
                 Text(String(format: "Pixel %.1f, %.1f", p.x, p.y)
-                    + (p.isGridPoint ? "  ·  column \(p.col! + 1), row \(p.row! + 1)" : ""))
+                    + (p.isGridPoint ? "  ·  column \(p.col! + 1), row \(p.row! + 1)" : "")
+                    + (p.isGridPoint ? (p.inferred ? "  ·  inferred" : "  ·  confidence \(confidenceText(p))") : ""))
                     .font(.callout).foregroundStyle(.secondary)
                 Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 6) {
                     GridRow {
@@ -346,25 +378,75 @@ private struct Inspector: View {
     }
 }
 
-private struct PointTable: View {
+/// How sure the detector was of a point, for display.
+private func confidenceText(_ p: MapPoint) -> String {
+    if p.inferred { return "inferred" }
+    guard let q = p.quality else { return "—" }
+    return "\(Int((q * 100).rounded()))%" + (p.reviewed ? " ✓" : "")
+}
+
+/// Values the points table sorts by. Missing values sort first.
+extension MapPoint {
+    var sortLongitude: Double { lon ?? -.infinity }
+    var sortLatitude: Double { lat ?? -.infinity }
+    /// Inferred points sort below everything the detector saw; points without a score sort last.
+    var sortConfidence: Double { inferred ? -1 : (quality ?? 2) }
+}
+
+/// The strip under the map while stepping through doubtful points.
+private struct ReviewBar: View {
     @EnvironmentObject var model: AppModel
 
     var body: some View {
-        Table(model.points, selection: Binding(get: { model.selection }, set: { newValue in
+        HStack(spacing: 10) {
+            Text("Review \(min(model.reviewPosition + 1, model.reviewIDs.count)) of \(model.reviewIDs.count)")
+                .font(.headline).monospacedDigit()
+            if let p = model.selectedPoint {
+                Text(p.inferred ? "Inferred: not seen in the image" : "Confidence \(confidenceText(p))")
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("Previous") { model.reviewStep(-1) }.disabled(model.reviewPosition == 0)
+            Button("Skip") { model.reviewStep(1) }.help("Leave it as it is and go on (Tab or Space)")
+            Button("Delete") { model.reviewDelete() }.help("Remove this point (Delete)")
+            Button("Accept") { model.reviewAccept() }
+                .help("It is in the right place (Return). Nudge it with the arrow keys first if not.")
+                .buttonStyle(.borderedProminent)
+            Button("Done") { model.endReview() }.help("Stop reviewing (Esc)")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(.bar)
+    }
+}
+
+private struct PointTable: View {
+    @EnvironmentObject var model: AppModel
+    @State private var sortOrder: [KeyPathComparator<MapPoint>] = []
+
+    private var rows: [MapPoint] { sortOrder.isEmpty ? model.points : model.points.sorted(using: sortOrder) }
+
+    var body: some View {
+        Table(rows, selection: Binding(get: { model.selection }, set: { newValue in
             model.selection = newValue
             if newValue != nil { model.revealRequest += 1 }
-        })) {
+        }), sortOrder: $sortOrder) {
             TableColumn("Use") { p in
                 Toggle("", isOn: Binding(get: { p.enabled }, set: { model.setEnabled(id: p.id, $0) }))
                     .labelsHidden()
             }
             .width(30)
-            TableColumn("Longitude") { p in
+            TableColumn("Longitude", value: \.sortLongitude) { p in
                 Text(p.lon.map { formatCoordinate($0, axis: .longitude) } ?? "—").monospacedDigit()
             }
-            TableColumn("Latitude") { p in
+            TableColumn("Latitude", value: \.sortLatitude) { p in
                 Text(p.lat.map { formatCoordinate($0, axis: .latitude) } ?? "—").monospacedDigit()
             }
+            TableColumn("Conf.", value: \.sortConfidence) { p in
+                Text(confidenceText(p)).monospacedDigit()
+                    .foregroundStyle(p.inferred ? Color(red: 0.85, green: 0.1, blue: 0.15) : .primary)
+            }
+            .width(min: 44, ideal: 58)
             TableColumn("Source") { p in
                 HStack(spacing: 5) {
                     Image(systemName: p.isGridPoint ? "circle.fill" : "square.fill")

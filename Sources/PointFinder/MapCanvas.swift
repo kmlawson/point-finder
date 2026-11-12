@@ -23,7 +23,9 @@ final class MapCanvasView: NSView {
     private var image: CGImage?
     private var lastFit = -1
     private var lastReveal = -1
+    private var lastFocus = 0
     weak var model: AppModel?
+    var cgImage: CGImage? { image }
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -89,7 +91,25 @@ final class MapCanvasView: NSView {
             lastReveal = model.revealRequest
             if let p = model.selectedPoint { reveal(Vec2(p.x, p.y)) }
         }
+        if model.focusRequest != lastFocus {
+            lastFocus = model.focusRequest
+            if let p = model.selectedPoint { focus(on: Vec2(p.x, p.y)) }
+        }
         overlay.window?.invalidateCursorRects(for: overlay)
+        overlay.needsDisplay = true
+    }
+
+    /// Centres an image position in the view, zoomed in to at least the preferred zoom.
+    func focus(on p: Vec2) {
+        guard image != nil else { return }
+        let target = min(scrollView.maxMagnification, max(scrollView.magnification, CGFloat(Prefs.focusZoom)))
+        scrollView.magnification = target
+        let doc = docPoint(for: p)
+        let size = scrollView.contentView.bounds.size
+        let origin = NSPoint(x: doc.x - size.width / 2, y: doc.y - size.height / 2)
+        let clip = scrollView.contentView
+        clip.setBoundsOrigin(clip.constrainBoundsRect(NSRect(origin: origin, size: size)).origin)
+        scrollView.reflectScrolledClipView(clip)
         overlay.needsDisplay = true
     }
 
@@ -233,6 +253,10 @@ private final class OverlayView: NSView {
             }
         }
 
+        if let id = dragPoint, moved, Prefs.loupeEnabled, let p = model.points.first(where: { $0.id == id }) {
+            drawLoupe(at: p, colour: color(for: p))
+        }
+
         if let drag = regionDrag {
             let rect = NSRect(
                 x: min(drag.from.x, drag.to.x), y: min(drag.from.y, drag.to.y),
@@ -248,6 +272,56 @@ private final class OverlayView: NSView {
             outline.setLineDash([6, 4], count: 2, phase: 0)
             outline.stroke()
         }
+    }
+
+    /// A magnified view of the map under a point that is being dragged, with a
+    /// cross-hair on the exact spot. It sits above the point, or below near the top edge.
+    private func drawLoupe(at p: MapPoint, colour: NSColor) {
+        guard let canvas, let cg = canvas.cgImage, let ctx = NSGraphicsContext.current?.cgContext else { return }
+        let size = CGFloat(Prefs.loupeSize)
+        let zoom = max(CGFloat(Prefs.loupeZoom), canvas.scrollView.magnification * 2.5)
+        let q = canvas.viewPoint(for: Vec2(p.x, p.y))
+        var centre = NSPoint(x: q.x, y: q.y + size * 0.5 + 34)
+        if centre.y + size / 2 > bounds.maxY - 4 { centre.y = q.y - size * 0.5 - 34 }
+        centre.x = min(max(centre.x, bounds.minX + size / 2 + 4), bounds.maxX - size / 2 - 4)
+        let frame = NSRect(x: centre.x - size / 2, y: centre.y - size / 2, width: size, height: size)
+
+        // The part of the image the magnifier covers, in pixels (y down).
+        let span = Double(size / zoom)
+        let want = CGRect(x: p.x - span / 2, y: p.y - span / 2, width: span, height: span)
+        let have = want.intersection(CGRect(x: 0, y: 0, width: cg.width, height: cg.height)).integral
+        ctx.saveGState()
+        ctx.addEllipse(in: frame)
+        ctx.clip()
+        NSColor(calibratedWhite: 0.22, alpha: 1).setFill()
+        frame.fill()
+        if !have.isEmpty, let crop = cg.cropping(to: have) {
+            ctx.interpolationQuality = .none
+            let dest = CGRect(
+                x: frame.minX + (have.minX - want.minX) * zoom,
+                y: frame.maxY - (have.maxY - want.minY) * zoom,
+                width: have.width * zoom, height: have.height * zoom)
+            ctx.draw(crop, in: dest)
+        }
+        // Cross-hair with a gap at the centre.
+        for (width, stroke) in [(3.0, NSColor.white), (1.0, colour)] {
+            let hair = NSBezierPath()
+            for (dx, dy) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
+                hair.move(to: NSPoint(x: centre.x + dx * 5, y: centre.y + dy * 5))
+                hair.line(to: NSPoint(x: centre.x + dx * size / 2, y: centre.y + dy * size / 2))
+            }
+            stroke.withAlphaComponent(0.9).setStroke()
+            hair.lineWidth = width
+            hair.stroke()
+        }
+        ctx.restoreGState()
+        let rim = NSBezierPath(ovalIn: frame)
+        NSColor.white.setStroke()
+        rim.lineWidth = 4
+        rim.stroke()
+        NSColor(calibratedWhite: 0.15, alpha: 1).setStroke()
+        rim.lineWidth = 1.5
+        rim.stroke()
     }
 
     // MARK: Mouse
@@ -292,6 +366,7 @@ private final class OverlayView: NSView {
         guard let canvas, let model else { return }
         let q = convert(event.locationInWindow, from: nil)
         if !moved && hypot(q.x - mouseDownAt.x, q.y - mouseDownAt.y) < 3 { return }
+        if !moved && dragPoint != nil && regionDrag == nil { model.willMove() }
         moved = true
         if regionDrag != nil {
             regionDrag?.to = q
@@ -320,10 +395,13 @@ private final class OverlayView: NSView {
             }
             return
         }
-        if let id = dragPoint, moved { model.finishedMoving(id: id) }
-        if panning && !moved { model.selection = nil }
+        if let id = dragPoint, moved {
+            model.finishedMoving(id: id, dropped: !event.modifierFlags.contains(.control))
+        }
+        if panning && !moved && !model.reviewing { model.selection = nil }
         dragPoint = nil
         panning = false
+        needsDisplay = true
     }
 
     override func scrollWheel(with event: NSEvent) {
@@ -353,8 +431,28 @@ private final class OverlayView: NSView {
         let step = event.modifierFlags.contains(.shift) ? 10.0 : (event.modifierFlags.contains(.option) ? 0.1 : 1.0)
         func nudge(_ dx: Double, _ dy: Double) {
             guard let p = model.selectedPoint else { return }
+            model.willMove()
             model.move(id: p.id, to: Vec2(p.x + dx * step, p.y + dy * step))
             model.finishedMoving(id: p.id)
+        }
+        // ⌘ with an arrow moves the selection to the neighbouring point.
+        if event.modifierFlags.contains(.command) {
+            switch event.keyCode {
+            case 123: return model.selectNeighbour(.left)
+            case 124: return model.selectNeighbour(.right)
+            case 125: return model.selectNeighbour(.down)
+            case 126: return model.selectNeighbour(.up)
+            default: return super.keyDown(with: event)
+            }
+        }
+        if model.reviewing {
+            switch event.keyCode {
+            case 36, 76: return model.reviewAccept()  // return, enter
+            case 51, 117: return model.reviewDelete()  // delete, forward delete
+            case 48, 49: return model.reviewStep(event.modifierFlags.contains(.shift) ? -1 : 1)  // tab, space
+            case 53: return model.endReview()  // escape
+            default: break
+            }
         }
         switch event.keyCode {
         case 51, 117: model.deleteSelected()  // delete, forward delete

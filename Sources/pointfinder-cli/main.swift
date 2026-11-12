@@ -19,6 +19,9 @@ let usage = """
       --min-line <fraction>  Shortest line kept, as a fraction of the image's shorter side (default 0.25).
       --mask <file.png>      Write the thin-dark-line mask the search runs on.
       --black-only           Ignore coloured ink; only black or grey lines count.
+      --ticks                The map has only ticks on its frame: join opposite ticks instead of
+                             looking for lines across the map.
+      --guess-projection     Print a guess at the projection from the shape of the grid.
       --no-search            Skip the second pass that looks for crossings the grid predicts.
       --search-distance <f>  How far from the predicted spot that pass may accept a crossing, as a
                              fraction of the grid spacing (default 0.12).
@@ -28,6 +31,8 @@ let usage = """
       --second-opinion <x0,y0,x1,y1>
                              After detection, search this rectangle (image pixels) again, as the
                              app's Second Opinion does. Its points are printed after the others.
+      --read-labels          Read the degree numbers in the margins (Apple Vision) and print the
+                             longitudes and latitudes they give the grid.
       --no-infer             Leave out intersections inferred from the lines but not seen in the image.
       --version              Print the version.
       --help                 Show this text.
@@ -51,6 +56,8 @@ var overlayMode = "lines"
 var maskPath: String?
 var params = DetectionParams()
 var secondOpinion: PixelRect?
+var readLabels = false
+var guessProjectionFlag = false
 while !args.isEmpty {
     let a = args.removeFirst()
     func value() -> String {
@@ -69,6 +76,9 @@ while !args.isEmpty {
     case "--black-only": params.ink = .blackOnly
     case "--no-infer": params.inferMissing = false
     case "--no-search": params.searchMissing = false
+    case "--read-labels": readLabels = true
+    case "--ticks": params.style = .ticks
+    case "--guess-projection": guessProjectionFlag = true
     case "--search-distance": params.searchFraction = Double(value()) ?? params.searchFraction
     case "--search-line": params.searchMinLine = Double(value()) ?? params.searchMinLine
     case "--leniency": params.secondOpinionLeniency = Double(value()) ?? params.secondOpinionLeniency
@@ -123,6 +133,37 @@ do {
             print(String(format: "%d\t%d\t%.2f\t%.2f\t%.2f\t%d", p.col, p.row, p.x, p.y, p.quality, p.inferred ? 1 : 0))
         }
         result.points.append(contentsOf: secondOpinionPoints)
+    }
+
+    if guessProjectionFlag {
+        let asPoints = result.points.enumerated().map { i, g -> MapPoint in
+            MapPoint(id: i, x: g.x, y: g.y, col: g.col, row: g.row)
+        }
+        if let guess = guessProjection(points: asPoints) {
+            for line in guess.report.split(separator: "\n", omittingEmptySubsequences: false) { print("# \(line)") }
+        } else {
+            print("# projection: too few grid points to judge")
+        }
+    }
+
+    if readLabels {
+        let started = Date()
+        let labels = recognizeText(in: cg)
+        let numeric = labels.filter { parseDegreeLabel($0.text) != nil }
+        let size = Double(max(cg.width, cg.height))
+        let candidates = labelCandidates(lines: result.lines, labels: labels, imageSize: size)
+        print(String(
+            format: "# labels: %d pieces of text, %d numbers, %.1fs", labels.count, numeric.count,
+            Date().timeIntervalSince(started)))
+        print("# column labels:", candidates.columns.sorted { $0.index < $1.index }.map { "\($0.index)=\(Int($0.value))" }.joined(separator: " "))
+        print("# row labels:", candidates.rows.sorted { $0.index < $1.index }.map { "\($0.index)=\(Int($0.value))" }.joined(separator: " "))
+        if let p = proposeGrid(lines: result.lines, labels: labels, imageSize: size) {
+            print(String(
+                format: "# grid: longitude %g + %g per column (%d labels), latitude %g %+g per row (%d labels)",
+                p.lonOrigin, p.lonStep, p.lonSupport, p.latOrigin, p.latStep, p.latSupport))
+        } else {
+            print("# grid: the labels do not give a consistent reading")
+        }
     }
 
     if let maskPath, let m = result.debugMask,

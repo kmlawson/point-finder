@@ -55,6 +55,15 @@ struct PointFinderApp: App {
         }
         .handlesExternalEvents(matching: ["*"])
         .commands {
+            CommandGroup(replacing: .undoRedo) {
+                Button(model.undoTitle) { model.undo() }.keyboardShortcut("z")
+                Button(model.redoTitle) { model.redo() }.keyboardShortcut("z", modifiers: [.command, .shift])
+            }
+            CommandGroup(after: .toolbar) {
+                Button("Zoom to Selection") { model.zoomToSelection() }
+                    .keyboardShortcut("e")
+                    .disabled(model.selection == nil)
+            }
             CommandGroup(replacing: .newItem) {
                 Button("Open Image…") { model.openPanel() }.keyboardShortcut("o")
             }
@@ -73,6 +82,17 @@ struct PointFinderApp: App {
                 Button("Calculate Coordinates") { model.calculate() }
                     .keyboardShortcut("k")
                     .disabled(model.referenceCount < 2)
+                Button("Read Margin Labels") { model.readMarginLabels() }
+                    .keyboardShortcut("l")
+                    .disabled(model.image == nil || model.busy != nil || !model.hasGrid)
+                Button("Guess Projection…") { model.guessProjectionNow() }
+                    .disabled(!model.hasGrid)
+                Divider()
+                Button(model.reviewing ? "Stop Review" : "Review Doubtful Points") {
+                    if model.reviewing { model.endReview() } else { model.startReview() }
+                }
+                .keyboardShortcut("r", modifiers: [.command, .shift])
+                .disabled(!model.hasGrid)
                 Divider()
                 Toggle("Second Opinion on an Area", isOn: $model.regionMode)
                     .keyboardShortcut("r")
@@ -85,7 +105,10 @@ struct PointFinderApp: App {
                 Button("Zoom to Fit") { model.fitRequest += 1 }.keyboardShortcut("0")
             }
         }
+        Settings { PreferencesView() }
     }
+
+    init() { Prefs.register() }
 }
 
 /// Development aid: when PF_SNAPSHOT_DIR is set, drives the app through its main
@@ -107,6 +130,11 @@ enum SelfCheck {
             func pause(_ seconds: Double) async { try? await Task.sleep(nanoseconds: UInt64(seconds * 1e9)) }
             FileHandle.standardError.write("selfcheck start\n".data(using: .utf8)!)
             await pause(1.5)
+            if let path = ProcessInfo.processInfo.environment["PF_SNAPSHOT_IMAGE"] {
+                model.open(URL(fileURLWithPath: path))
+                await pause(0.5)
+                if model.busy == nil && !model.hasGrid { model.detect() }
+            }
             while model.busy != nil { await pause(0.2) }
             await pause(1)
             snap("1-detected.png")
@@ -124,6 +152,27 @@ enum SelfCheck {
                 model.addPoint(at: Vec2(2400, 1500))
                 await pause(0.6)
                 snap("4-added.png")
+                // Undo and redo through the window's undo manager.
+                let before = model.points.count
+                model.undo()
+                await pause(0.3)
+                let undone = model.points.count
+                model.redo()
+                await pause(0.3)
+                FileHandle.standardError.write(
+                    "undo: \(before) -> \(undone) -> \(model.points.count)\n".data(using: .utf8)!)
+                model.startReview()
+                await pause(0.8)
+                FileHandle.standardError.write(
+                    "review: \(model.reviewIDs.count) points, reviewing \(model.reviewing)\n".data(using: .utf8)!)
+                snap("5-review.png")
+                model.reviewAccept()
+                await pause(0.6)
+                snap("6-review-next.png")
+                model.endReview()
+                if let guess = guessProjection(points: model.points) {
+                    FileHandle.standardError.write("projection: \(guess.name)\n".data(using: .utf8)!)
+                }
             }
             if let out = ProcessInfo.processInfo.environment["PF_SNAPSHOT_SAVE"] {
                 try? GCPFile.write(model.points, to: URL(fileURLWithPath: out))

@@ -36,6 +36,19 @@ final class AppModel: ObservableObject {
     @Published var revealRequest = 0
     /// Bumped to move keyboard focus to the longitude field.
     @Published var editRequest = 0
+    /// Bumped to zoom in on the selected point.
+    @Published var focusRequest = 0
+    /// Points being stepped through in review, and how far the review has got.
+    @Published var reviewIDs: [Int] = []
+    @Published var reviewPosition = 0
+    @Published var reviewing = false
+    /// The last projection guess asked for; saved beside the points.
+    @Published var projection: ProjectionGuess?
+    /// Earlier states of the points, newest last, each with the name of the change that followed it.
+    @Published private var undoStack: [(snapshot: Snapshot, name: String)] = []
+    @Published private var redoStack: [(snapshot: Snapshot, name: String)] = []
+    /// The grey image the last detection ran on, kept for snapping and second opinions.
+    private var grayCache: (image: CGImage, ink: InkMode, gray: GrayImage)?
 
     private(set) var pointsFileURL: URL?
     private var nextID = 1
@@ -71,6 +84,12 @@ final class AppModel: ObservableObject {
             points = []
             lines = []
             rejectedLines = []
+            projection = nil
+            reviewing = false
+            reviewIDs = []
+            grayCache = nil
+            undoStack = []
+            redoStack = []
             selection = nil
             solution = nil
             nextID = 1
@@ -102,29 +121,33 @@ final class AppModel: ObservableObject {
         progress = 0
         let params = self.params
         Task.detached(priority: .userInitiated) {
-            let outcome: Result<DetectionResult, Error>
+            let outcome: Result<(DetectionResult, GrayImage), Error>
             do {
                 let gray = try grayImage(from: cg, ink: params.ink)
-                outcome = .success(detectGraticule(gray: gray, params: params) { stage, fraction in
+                let result = detectGraticule(gray: gray, params: params) { stage, fraction in
                     Task { @MainActor in
                         self.busy = stage
                         self.progress = fraction
                     }
-                })
+                }
+                outcome = .success((result, gray))
             } catch {
                 outcome = .failure(error)
             }
-            await MainActor.run { self.finishDetection(outcome, for: cg) }
+            await MainActor.run { self.finishDetection(outcome, for: cg, ink: params.ink) }
         }
     }
 
-    private func finishDetection(_ outcome: Result<DetectionResult, Error>, for cg: CGImage) {
+    private func finishDetection(_ outcome: Result<(DetectionResult, GrayImage), Error>, for cg: CGImage, ink: InkMode) {
         busy = nil
         guard cg === image else { return }
         switch outcome {
         case .failure(let error):
             status = error.localizedDescription
-        case .success(let result):
+        case .success(let (result, gray)):
+            grayCache = (cg, ink, gray)
+            if !result.points.isEmpty { checkpoint("Detect Intersections") }
+            reviewing = false
             let merged = mergeDetection(existing: points, detected: result.points, nextID: nextID)
             nextID = (merged.map { $0.id }.max() ?? nextID) + 1
             points = merged
@@ -142,7 +165,231 @@ final class AppModel: ObservableObject {
                 hasUnsavedChanges = true
             }
             recalculateQuietly()
+            if Prefs.readLabelsAfterDetect && !result.points.isEmpty && referenceCount == 0 { readMarginLabels() }
         }
+    }
+
+    /// The grey image for the current map, computed once per ink setting.
+    private func currentGray() -> GrayImage? {
+        guard let cg = image else { return nil }
+        if let cache = grayCache, cache.image === cg, cache.ink == params.ink { return cache.gray }
+        guard let gray = try? grayImage(from: cg, ink: params.ink) else { return nil }
+        grayCache = (cg, params.ink, gray)
+        return gray
+    }
+
+    // MARK: Undo
+
+    private struct Snapshot {
+        var points: [MapPoint]
+        var lines: [GridLine]
+        var solution: GridSolution?
+        var selection: Int?
+        var nextID: Int
+    }
+
+    private var present: Snapshot {
+        Snapshot(points: points, lines: lines, solution: solution, selection: selection, nextID: nextID)
+    }
+
+    /// Call before changing the points: makes the change undoable.
+    private func checkpoint(_ name: String) {
+        undoStack.append((present, name))
+        if undoStack.count > 200 { undoStack.removeFirst() }
+        redoStack = []
+    }
+
+    var undoTitle: String { undoStack.last.map { "Undo \($0.name)" } ?? "Undo" }
+    var redoTitle: String { redoStack.last.map { "Redo \($0.name)" } ?? "Redo" }
+    var canUndo: Bool { !undoStack.isEmpty }
+    var canRedo: Bool { !redoStack.isEmpty }
+
+    /// While a text field is being edited, Undo and Redo belong to the typing in it.
+    private func textUndoManager() -> UndoManager? {
+        (NSApp.keyWindow?.firstResponder as? NSText)?.undoManager
+    }
+
+    func undo() {
+        if let text = textUndoManager(), text.canUndo { return text.undo() }
+        guard busy == nil, let last = undoStack.popLast() else { return NSSound.beep() }
+        redoStack.append((present, last.name))
+        restore(last.snapshot)
+        status = "Undid: \(last.name)."
+    }
+
+    func redo() {
+        if let text = textUndoManager(), text.canRedo { return text.redo() }
+        guard busy == nil, let next = redoStack.popLast() else { return NSSound.beep() }
+        undoStack.append((present, next.name))
+        restore(next.snapshot)
+        status = "Redid: \(next.name)."
+    }
+
+    private func restore(_ snapshot: Snapshot) {
+        points = snapshot.points
+        lines = snapshot.lines
+        solution = snapshot.solution
+        nextID = max(nextID, snapshot.nextID)
+        selection = snapshot.selection.flatMap { id in points.contains { $0.id == id } ? id : nil }
+        hasUnsavedChanges = true
+        if reviewing { reviewIDs = reviewIDs.filter { id in points.contains { $0.id == id } } }
+    }
+
+    // MARK: Review
+
+    /// Starts stepping through the doubtful points: inferred ones, then low-confidence ones.
+    func startReview() {
+        let queue = reviewQueue(points, threshold: Prefs.reviewThreshold)
+        guard !queue.isEmpty else {
+            status = "Nothing to review: no inferred points, and none below "
+                + "\(Int((Prefs.reviewThreshold * 100).rounded()))% confidence."
+            return
+        }
+        regionMode = false
+        addMode = false
+        reviewIDs = queue
+        reviewPosition = 0
+        reviewing = true
+        showReviewPoint()
+    }
+
+    func endReview(finished: Bool = false) {
+        guard reviewing else { return }
+        reviewing = false
+        reviewIDs = []
+        status = finished ? "Review finished." : "Review stopped."
+    }
+
+    private func showReviewPoint() {
+        // Skip anything deleted since the review began.
+        while reviewPosition < reviewIDs.count, index(of: reviewIDs[reviewPosition]) == nil { reviewPosition += 1 }
+        guard reviewPosition < reviewIDs.count else {
+            endReview(finished: true)
+            return
+        }
+        selection = reviewIDs[reviewPosition]
+        focusRequest += 1
+    }
+
+    func reviewStep(_ by: Int) {
+        guard reviewing else { return }
+        let target = reviewPosition + by
+        if target < 0 { return }
+        reviewPosition = target
+        showReviewPoint()
+    }
+
+    /// Marks the point under review as checked and moves on.
+    func reviewAccept() {
+        guard reviewing, reviewPosition < reviewIDs.count, let i = index(of: reviewIDs[reviewPosition]) else { return }
+        checkpoint("Accept Point")
+        points[i].reviewed = true
+        points[i].inferred = false
+        hasUnsavedChanges = true
+        reviewStep(1)
+    }
+
+    func reviewDelete() {
+        guard reviewing, reviewPosition < reviewIDs.count else { return }
+        delete(id: reviewIDs[reviewPosition])
+        reviewStep(1)
+    }
+
+    // MARK: Moving between points
+
+    func selectNeighbour(_ step: GridStep) {
+        guard let s = selection, let next = neighbour(of: s, in: points, step: step) else {
+            NSSound.beep()
+            return
+        }
+        selection = next
+        if Prefs.zoomOnNavigate { focusRequest += 1 } else { revealRequest += 1 }
+    }
+
+    func zoomToSelection() {
+        if selection != nil { focusRequest += 1 }
+    }
+
+    // MARK: Margin labels
+
+    /// Reads the degree labels in the map's margins and offers the grid they give.
+    func readMarginLabels() {
+        guard let cg = image, busy == nil else { return }
+        guard hasGrid, !lines.isEmpty else {
+            status = "Reading margin labels needs the grid lines from Detect first."
+            NSSound.beep()
+            return
+        }
+        let lines = self.lines
+        busy = "Reading margin labels"
+        progress = 0.5
+        Task.detached(priority: .userInitiated) {
+            let labels = recognizeText(in: cg)
+            let proposal = proposeGrid(lines: lines, labels: labels, imageSize: Double(max(cg.width, cg.height)))
+            await MainActor.run { self.finishReadingLabels(proposal, for: cg) }
+        }
+    }
+
+    private func finishReadingLabels(_ proposal: LabelProposal?, for cg: CGImage) {
+        busy = nil
+        guard cg === image else { return }
+        guard let proposal else {
+            status = "The margin labels did not give a consistent reading. Enter two reference points by hand."
+            return
+        }
+        guard let pair = referencePair(in: points), let a = index(of: pair.0), let b = index(of: pair.1) else {
+            status = "The labels were read, but there are no two intersections diagonal from each other to carry them."
+            return
+        }
+        let grid = points.filter { $0.isGridPoint }
+        let cols = grid.map { $0.col! }, rows = grid.map { $0.row! }
+        let first = proposal.coordinate(col: cols.min()!, row: rows.min()!)
+        let last = proposal.coordinate(col: cols.max()!, row: rows.max()!)
+        let alert = NSAlert()
+        alert.messageText = "Use the grid read from the margin labels?"
+        alert.informativeText =
+            "Meridians: \(formatCoordinate(first.lon, axis: .longitude)) to \(formatCoordinate(last.lon, axis: .longitude)), "
+            + "every \(trimmed(proposal.lonStep)) (\(proposal.lonSupport) labels agree).\n"
+            + "Parallels: \(formatCoordinate(first.lat, axis: .latitude)) to \(formatCoordinate(last.lat, axis: .latitude)), "
+            + "every \(trimmed(abs(proposal.latStep))) (\(proposal.latSupport) labels agree).\n\n"
+            + "East/west and north/south are judged from the direction the numbers run, assuming north is up. "
+            + "Two reference points will be set from this and the rest calculated. Check a few against the map."
+        alert.addButton(withTitle: "Use These")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else {
+            status = "Margin labels not used."
+            return
+        }
+        checkpoint("Read Margin Labels")
+        for i in [a, b] {
+            let v = proposal.coordinate(col: points[i].col!, row: points[i].row!)
+            points[i].lon = v.lon
+            points[i].lat = v.lat
+            points[i].source = .user
+        }
+        hasUnsavedChanges = true
+        calculate(undoable: false)
+    }
+
+    // MARK: Projection
+
+    /// Works out the likely projection from the grid and shows the reasoning.
+    func guessProjectionNow() {
+        guard let guess = guessProjection(points: points) else {
+            status = "Guessing the projection needs a grid: at least two meridians and two parallels with three intersections each."
+            NSSound.beep()
+            return
+        }
+        projection = guess
+        let alert = NSAlert()
+        alert.messageText = guess.name
+        alert.informativeText = guess.report
+            + (solution == nil ? "\nCalculate the coordinates first for an estimate of the projection's parameters." : "")
+            + "\nThis will be saved beside the points file."
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+        status = "Projection guess: \(guess.name). It is saved beside the points file."
+        hasUnsavedChanges = true
     }
 
     // MARK: Second opinion
@@ -165,10 +412,11 @@ final class AppModel: ObservableObject {
         let ink = params.ink
         busy = "Looking again at the selected area"
         progress = 0.5
+        let cached = grayCache.flatMap { $0.image === cg && $0.ink == ink ? $0.gray : nil }
         Task.detached(priority: .userInitiated) {
             let outcome: Result<[GridPoint], Error>
             do {
-                let gray = try grayImage(from: cg, ink: ink)
+                let gray = try cached ?? grayImage(from: cg, ink: ink)
                 outcome = .success(completeGrid(gray: gray, known: known, params: completion))
             } catch {
                 outcome = .failure(error)
@@ -193,9 +441,11 @@ final class AppModel: ObservableObject {
                 status = "Second opinion: nothing new in that area."
                 return
             }
+            checkpoint("Second Opinion")
             for g in fresh {
                 var p = MapPoint(id: nextID, x: g.x, y: g.y, col: g.col, row: g.row)
                 p.inferred = g.inferred
+                p.quality = g.quality
                 nextID += 1
                 points.append(p)
             }
@@ -220,6 +470,7 @@ final class AppModel: ObservableObject {
         do {
             let lon = try parseCoordinate(lonText, axis: .longitude)
             let lat = try parseCoordinate(latText, axis: .latitude)
+            checkpoint("Set Coordinates")
             points[i].lon = lon
             points[i].lat = lat
             points[i].source = .user
@@ -244,6 +495,7 @@ final class AppModel: ObservableObject {
 
     func clearCoordinate(id: Int) {
         guard let i = index(of: id) else { return }
+        checkpoint("Clear Coordinates")
         points[i].lon = nil
         points[i].lat = nil
         points[i].source = nil
@@ -252,6 +504,7 @@ final class AppModel: ObservableObject {
 
     func delete(id: Int) {
         guard let i = index(of: id) else { return }
+        checkpoint("Delete Point")
         points.remove(at: i)
         if selection == id { selection = nil }
         hasUnsavedChanges = true
@@ -263,12 +516,14 @@ final class AppModel: ObservableObject {
 
     func setEnabled(id: Int, _ enabled: Bool) {
         guard let i = index(of: id) else { return }
+        checkpoint(enabled ? "Use Point" : "Leave Out Point")
         points[i].enabled = enabled
         hasUnsavedChanges = true
     }
 
     func addPoint(at p: Vec2) {
         guard let image, p.x >= 0, p.y >= 0, p.x <= Double(image.width), p.y <= Double(image.height) else { return }
+        checkpoint("Add Point")
         let point = MapPoint(id: nextID, x: p.x, y: p.y)
         nextID += 1
         points.append(point)
@@ -287,15 +542,33 @@ final class AppModel: ObservableObject {
         hasUnsavedChanges = true
     }
 
-    /// Called when a drag or nudge ends: an estimated coordinate depends on position.
-    func finishedMoving(id: Int) {
+    /// Call once before a drag or a nudge moves a point, so the move can be undone.
+    func willMove() { checkpoint("Move Point") }
+
+    /// Called when a drag or nudge ends. A point dropped by the mouse near a
+    /// crossing of two lines moves onto it (if that preference is on).
+    func finishedMoving(id: Int, dropped: Bool = false) {
         guard let i = index(of: id) else { return }
+        if dropped && Prefs.snapOnDrop, let gray = currentGray() {
+            let here = Vec2(points[i].x, points[i].y)
+            let hint = nearestLineDirections(at: here, lines: lines).map { [($0.row, $0.column)] } ?? []
+            let unit = max(1, Double(max(gray.width, gray.height)) / 5000)
+            if let snapped = snapToCrossing(
+                gray: gray, near: here, directions: hint, radius: Prefs.snapRadius * unit,
+                contrast: params.contrast, minArm: params.minArm)
+            {
+                points[i].x = snapped.x
+                points[i].y = snapped.y
+                status = "Snapped to the crossing. Hold Control while letting go to place a point freely."
+            }
+        }
         if points[i].source == .estimated { recalculateQuietly() }
     }
 
     func snapSelectedToGraticule() {
         guard let s = selection, let i = index(of: s), let solution,
               let lon = points[i].lon, let lat = points[i].lat else { return }
+        checkpoint("Snap to Graticule")
         let v = solution.snapped(lon: lon, lat: lat)
         points[i].lon = v.lon
         points[i].lat = v.lat
@@ -305,9 +578,12 @@ final class AppModel: ObservableObject {
 
     // MARK: Calculating
 
-    func calculate() {
+    func calculate(undoable: Bool = true) {
         do {
-            let summary = try calculateCoordinates(&points)
+            var updated = points
+            let summary = try calculateCoordinates(&updated)
+            if undoable { checkpoint("Calculate Coordinates") }
+            points = updated
             solution = summary.solution
             hasUnsavedChanges = true
             var text = "Calculated \(summary.gridPointsFilled) intersections from \(referenceCount) reference points"
@@ -363,9 +639,16 @@ final class AppModel: ObservableObject {
             try GCPFile.write(points, to: target)
             pointsFileURL = target
             hasUnsavedChanges = false
+            var projectionNote = ""
+            if projection != nil || Prefs.writeProjectionOnSave, let guess = guessProjection(points: points) {
+                projection = guess
+                let file = target.deletingPathExtension().appendingPathExtension("projection.txt")
+                try guess.report.write(to: file, atomically: true, encoding: .utf8)
+                projectionNote = " Projection guess in \(file.lastPathComponent)."
+            }
             let skipped = points.count - savableCount
             status = "Saved \(savableCount) points to \(target.lastPathComponent)."
-                + (skipped > 0 ? " \(skipped) without coordinates were left out." : "")
+                + (skipped > 0 ? " \(skipped) without coordinates were left out." : "") + projectionNote
         } catch {
             status = "Could not save: \(error.localizedDescription)"
         }

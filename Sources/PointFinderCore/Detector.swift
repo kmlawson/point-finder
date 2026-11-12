@@ -1,6 +1,15 @@
 import Foundation
 
+/// How the map shows its graticule.
+public enum GraticuleStyle: String, Sendable, CaseIterable {
+    /// Meridians and parallels are drawn across the map.
+    case lines
+    /// Only ticks on the frame; the lines are constructed by joining opposite ticks.
+    case ticks
+}
+
 public struct DetectionParams: Sendable {
+    public var style = GraticuleStyle.lines
     /// Longest side of the image the line search works on; larger images are reduced.
     public var maxWorkDimension = 4000
     public var ink = InkMode.anyDark
@@ -152,6 +161,7 @@ public func detectGraticule(
     gray: GrayImage, params: DetectionParams = DetectionParams(),
     progress: ((String, Double) -> Void)? = nil
 ) -> DetectionResult {
+    if params.style == .ticks { return detectTickGraticule(gray: gray, params: params, progress: progress) }
     var result = DetectionResult()
     let maxDim = max(gray.width, gray.height)
     let scale = min(1, Double(params.maxWorkDimension) / Double(maxDim))
