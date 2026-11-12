@@ -15,8 +15,9 @@ Work in progress.
   gutter, heavy lettering) detection finds 74 intersections (one of them inferred) in about a second,
   numbered consistently across both pages.
 - The app window has been checked through its self-snapshot mode (detect,
-  reference points, calculate, add, undo/redo, review). The magnifier, snapping
-  on drop, the area drag and the Preferences window have **not** been exercised
+  reference points, calculate, add, undo/redo, review, the toolbar's
+  customisation sheet). The magnifier, snapping on drop, the area drag, the
+  buttons added to the toolbar and the Preferences window have **not** been exercised
   by hand yet, and tick-only detection has only been tried on a drawn test map,
   not a real scan.
 - Not yet checked: loading a saved file into the QGIS Georeferencer.
@@ -83,8 +84,26 @@ detection.
 - A point dropped near a crossing **snaps** onto it; hold Control while letting
   go to place it freely.
 
+- View ▸ **Zoom In / Zoom Out / Actual Size / Zoom to Fit** (⌘+ ⌘− ⌘1 ⌘0) zoom
+  about the middle of the view.
+
 The magnifier, snapping, navigation zoom, the review threshold and the two
 automation switches are in **Preferences** (⌘,).
+
+### Toolbar
+
+The toolbar can be changed: right-click it, or choose View ▸ **Customize
+Toolbar…**, then drag buttons in, out or into another order. The same sheet
+switches between icons only and icons with their names, and dragging the
+default set back restores it. The arrangement is remembered.
+
+It starts with Open, Save, Undo, Redo, Detect, Detection Settings, Second
+Opinion, Read Labels, Calculate, Review, Add Points, Zoom to Fit and the View
+menu. Also on offer: Save As, Guess Projection, Delete Point, Coordinates
+(type the selected point's values), Snap to Graticule, West / East / North /
+South (move the selection along the grid), Zoom Out, Zoom In, Actual Size, Zoom
+to Selection, Lines and Labels (show or hide them), Magnifier and Snap (the two
+Preferences switches) and Preferences.
 
 ### Projection guess
 
@@ -217,6 +236,7 @@ MIT license; see `LICENSE`.
 - `scripts/build-app.sh` — packages the app
 
 Setting `PF_SNAPSHOT_DIR=<folder>` when launching makes the app run through
-detect → reference points → calculate → add point → undo/redo → review, write
+detect → reference points → calculate → add point → undo/redo → review →
+toolbar customisation sheet, write
 pictures of its window to that folder, and quit; `PF_SNAPSHOT_IMAGE=<file>`
 names the map to open. It is a development aid for the sample map.

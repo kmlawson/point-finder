@@ -59,10 +59,27 @@ struct PointFinderApp: App {
                 Button(model.undoTitle) { model.undo() }.keyboardShortcut("z")
                 Button(model.redoTitle) { model.redo() }.keyboardShortcut("z", modifiers: [.command, .shift])
             }
+            // View ▸ Show/Hide Toolbar and Customize Toolbar…
+            ToolbarCommands()
             CommandGroup(after: .toolbar) {
+                Button("Zoom In") { model.zoom(by: 1.5) }
+                    .keyboardShortcut("+")
+                    .disabled(model.image == nil)
+                Button("Zoom Out") { model.zoom(by: 1 / 1.5) }
+                    .keyboardShortcut("-")
+                    .disabled(model.image == nil)
+                Button("Actual Size") { model.zoom(by: 0) }
+                    .keyboardShortcut("1")
+                    .disabled(model.image == nil)
+                Button("Zoom to Fit") { model.fitRequest += 1 }
+                    .keyboardShortcut("0")
+                    .disabled(model.image == nil)
                 Button("Zoom to Selection") { model.zoomToSelection() }
                     .keyboardShortcut("e")
                     .disabled(model.selection == nil)
+                Divider()
+                Toggle("Show Detected Lines", isOn: $model.showLines)
+                Toggle("Show Coordinate Labels", isOn: $model.showLabels)
             }
             CommandGroup(replacing: .newItem) {
                 Button("Open Image…") { model.openPanel() }.keyboardShortcut("o")
@@ -99,10 +116,6 @@ struct PointFinderApp: App {
                     .disabled(model.image == nil || model.busy != nil || !model.hasGrid)
                 Toggle("Add Points", isOn: $model.addMode).keyboardShortcut("a", modifiers: [.command, .shift])
                 Button("Delete Selected Point") { model.deleteSelected() }.disabled(model.selection == nil)
-                Divider()
-                Toggle("Show Detected Lines", isOn: $model.showLines)
-                Toggle("Show Labels", isOn: $model.showLabels)
-                Button("Zoom to Fit") { model.fitRequest += 1 }.keyboardShortcut("0")
             }
         }
         Settings { PreferencesView() }
@@ -170,6 +183,23 @@ enum SelfCheck {
                 await pause(0.6)
                 snap("6-review-next.png")
                 model.endReview()
+                // The toolbar's customisation sheet, to check what it offers.
+                if let window = NSApp.windows.first(where: { $0.isVisible && $0.toolbar != nil }) {
+                    window.toolbar?.runCustomizationPalette(nil)
+                    await pause(1.5)
+                    let shown = window.toolbar?.items.count ?? 0
+                    let customizable = window.toolbar?.allowsUserCustomization ?? false
+                    FileHandle.standardError.write(
+                        "toolbar: \(shown) items shown, customizable \(customizable)\n".data(using: .utf8)!)
+                    if let sheet = window.attachedSheet, let view = sheet.contentView?.superview,
+                       let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
+                        view.cacheDisplay(in: view.bounds, to: rep)
+                        try? rep.representation(using: .png, properties: [:])?
+                            .write(to: URL(fileURLWithPath: dir).appendingPathComponent("7-toolbar-palette.png"))
+                        window.endSheet(sheet)
+                    }
+                    snap("8-toolbar.png")
+                }
                 if let guess = guessProjection(points: model.points) {
                     FileHandle.standardError.write("projection: \(guess.name)\n".data(using: .utf8)!)
                 }

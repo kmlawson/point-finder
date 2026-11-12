@@ -38,6 +38,15 @@ final class AppModel: ObservableObject {
     @Published var editRequest = 0
     /// Bumped to zoom in on the selected point.
     @Published var focusRequest = 0
+    /// Bumped to zoom the map about the middle of the view by `zoomFactor`
+    /// (0 means show the image at actual size).
+    @Published var zoomRequest = 0
+    var zoomFactor = 1.0
+
+    func zoom(by factor: Double) {
+        zoomFactor = factor
+        zoomRequest += 1
+    }
     /// Points being stepped through in review, and how far the review has got.
     @Published var reviewIDs: [Int] = []
     @Published var reviewPosition = 0

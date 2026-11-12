@@ -5,6 +5,8 @@ import UniformTypeIdentifiers
 struct ContentView: View {
     @EnvironmentObject var model: AppModel
     @State private var showSettings = false
+    @AppStorage(Prefs.Key.loupeEnabled) private var loupeEnabled = true
+    @AppStorage(Prefs.Key.snapOnDrop) private var snapOnDrop = true
 
     var body: some View {
         VStack(spacing: 0) {
@@ -26,7 +28,13 @@ struct ContentView: View {
             Divider()
             statusBar
         }
-        .toolbar { toolbar }
+        .toolbar(id: "main") {
+            fileItems
+            workflowItems
+            pointItems
+            viewItems
+            switchItems
+        }
         .navigationTitle(model.imageURL?.lastPathComponent ?? "Point Finder")
         .navigationSubtitle(model.hasUnsavedChanges ? "Edited" : "")
         .onDrop(of: [.fileURL], isTargeted: nil) { providers in
@@ -73,48 +81,187 @@ struct ContentView: View {
         .frame(minHeight: 30)
     }
 
+    // The toolbar is customisable: right-click it, or View ▸ Customize Toolbar…,
+    // to add, remove and rearrange these. Items marked `shown: false` start in
+    // the customisation sheet, not in the toolbar.
+
+    private func item<V: View>(_ id: String, shown: Bool = true, @ViewBuilder _ content: () -> V)
+        -> ToolbarItem<String, V>
+    {
+        ToolbarItem(id: id, placement: .automatic, showsByDefault: shown, content: content)
+    }
+
+    private var canSearch: Bool { model.image != nil && model.busy == nil && model.hasGrid }
+    private var canSnapSelection: Bool {
+        guard let p = model.selectedPoint else { return false }
+        return !p.isGridPoint && model.solution != nil && p.hasCoordinate
+    }
+
     @ToolbarContentBuilder
-    private var toolbar: some ToolbarContent {
-        ToolbarItemGroup(placement: .navigation) {
+    private var fileItems: some CustomizableToolbarContent {
+        item("open") {
             Button { model.openPanel() } label: { Label("Open", systemImage: "folder") }
                 .help("Open a map image (⌘O)")
         }
-        ToolbarItemGroup(placement: .principal) {
-            Button { model.detect() } label: { Label("Detect", systemImage: "viewfinder") }
-                .help("Find graticule intersections (⌘D)")
-                .disabled(model.image == nil || model.busy != nil)
-            Button { showSettings.toggle() } label: { Label("Detection Settings", systemImage: "slider.horizontal.3") }
-                .help("Adjust how lines are detected")
-                .disabled(model.image == nil)
-                .popover(isPresented: $showSettings, arrowEdge: .bottom) { DetectionSettings() }
-            Toggle(isOn: $model.regionMode) { Label("Second Opinion", systemImage: "rectangle.dashed") }
-                .help("Drag a rectangle on the map to search that area again for missed intersections")
-                .disabled(model.image == nil || model.busy != nil || !model.hasGrid)
-            Button {
-                if model.reviewing { model.endReview() } else { model.startReview() }
-            } label: {
-                Label(model.reviewing ? "Stop Review" : "Review", systemImage: "checklist")
-            }
-            .help("Step through the inferred and low-confidence points one at a time (⇧⌘R)")
-            .disabled(model.image == nil || !model.hasGrid)
-            Toggle(isOn: $model.addMode) { Label("Add Points", systemImage: "plus.viewfinder") }
-                .help("Click the map to add a point (or Option-click at any time)")
-                .disabled(model.image == nil)
-            Button { model.readMarginLabels() } label: { Label("Read Labels", systemImage: "text.viewfinder") }
-                .help("Read the degree numbers in the margins and propose the grid's coordinates (⌘L)")
-                .disabled(model.image == nil || model.busy != nil || !model.hasGrid)
-            Button { model.calculate() } label: { Label("Calculate", systemImage: "function") }
-                .help("Work out every other point from your reference points (⌘K)")
-                .disabled(model.referenceCount < 2)
+        item("save") {
             Button { model.save() } label: { Label("Save", systemImage: "square.and.arrow.down") }
                 .help("Save a .points file for the QGIS Georeferencer (⌘S)")
                 .disabled(model.savableCount == 0)
         }
-        ToolbarItemGroup(placement: .automatic) {
+        item("saveAs", shown: false) {
+            Button { model.save(askForLocation: true) } label: {
+                Label("Save As", systemImage: "square.and.arrow.down.on.square")
+            }
+            .help("Save the points under another name or in another place (⇧⌘S)")
+            .disabled(model.savableCount == 0)
+        }
+        item("undo") {
+            Button { model.undo() } label: { Label("Undo", systemImage: "arrow.uturn.backward") }
+                .help("\(model.undoTitle) (⌘Z)")
+                .disabled(!model.canUndo)
+        }
+        item("redo") {
+            Button { model.redo() } label: { Label("Redo", systemImage: "arrow.uturn.forward") }
+                .help("\(model.redoTitle) (⇧⌘Z)")
+                .disabled(!model.canRedo)
+        }
+    }
+
+    @ToolbarContentBuilder
+    private var workflowItems: some CustomizableToolbarContent {
+        item("detect") {
+            Button { model.detect() } label: { Label("Detect", systemImage: "viewfinder") }
+                .help("Find graticule intersections (⌘D)")
+                .disabled(model.image == nil || model.busy != nil)
+        }
+        item("detectionSettings") {
+            Button { showSettings.toggle() } label: { Label("Detection Settings", systemImage: "slider.horizontal.3") }
+                .help("Adjust how lines are detected")
+                .disabled(model.image == nil)
+                .popover(isPresented: $showSettings, arrowEdge: .bottom) { DetectionSettings() }
+        }
+        item("secondOpinion") {
+            Toggle(isOn: $model.regionMode) { Label("Second Opinion", systemImage: "rectangle.dashed") }
+                .help("Drag a rectangle on the map to search that area again for missed intersections (⌘R)")
+                .disabled(!canSearch)
+        }
+        item("readLabels") {
+            Button { model.readMarginLabels() } label: { Label("Read Labels", systemImage: "text.viewfinder") }
+                .help("Read the degree numbers in the margins and propose the grid's coordinates (⌘L)")
+                .disabled(!canSearch)
+        }
+        item("calculate") {
+            Button { model.calculate() } label: { Label("Calculate", systemImage: "function") }
+                .help("Work out every other point from your reference points (⌘K)")
+                .disabled(model.referenceCount < 2)
+        }
+        item("review") {
+            // A fixed name, so the item reads the same in the customisation sheet.
+            Toggle(isOn: Binding(
+                get: { model.reviewing },
+                set: { if $0 { model.startReview() } else { model.endReview() } })
+            ) {
+                Label("Review", systemImage: "checklist")
+            }
+            .help("Step through the inferred and low-confidence points one at a time (⇧⌘R)")
+            .disabled(model.image == nil || !model.hasGrid)
+        }
+        item("projection", shown: false) {
+            Button { model.guessProjectionNow() } label: { Label("Guess Projection", systemImage: "globe") }
+                .help("Judge the map's projection from the shape of its grid")
+                .disabled(!model.hasGrid)
+        }
+    }
+
+    @ToolbarContentBuilder
+    private var pointItems: some CustomizableToolbarContent {
+        item("addPoints") {
+            Toggle(isOn: $model.addMode) { Label("Add Points", systemImage: "plus.viewfinder") }
+                .help("Click the map to add a point (or Option-click at any time) (⇧⌘A)")
+                .disabled(model.image == nil)
+        }
+        item("deletePoint", shown: false) {
+            Button { model.deleteSelected() } label: { Label("Delete Point", systemImage: "trash") }
+                .help("Remove the selected point (Delete)")
+                .disabled(model.selection == nil)
+        }
+        item("typeCoordinates", shown: false) {
+            Button { model.editRequest += 1 } label: { Label("Coordinates", systemImage: "character.cursor.ibeam") }
+                .help("Type the selected point's longitude and latitude (Return)")
+                .disabled(model.selection == nil)
+        }
+        item("snapToGraticule", shown: false) {
+            Button { model.snapSelectedToGraticule() } label: { Label("Snap to Graticule", systemImage: "grid") }
+                .help("Round the selected added point to the nearest crossing of the map's grid lines")
+                .disabled(!canSnapSelection)
+        }
+        item("previousColumn", shown: false) {
+            Button { model.selectNeighbour(.left) } label: { Label("West", systemImage: "arrow.left") }
+                .help("Select the next intersection to the left (⌘←)")
+                .disabled(model.selection == nil)
+        }
+        item("nextColumn", shown: false) {
+            Button { model.selectNeighbour(.right) } label: { Label("East", systemImage: "arrow.right") }
+                .help("Select the next intersection to the right (⌘→)")
+                .disabled(model.selection == nil)
+        }
+        item("previousRow", shown: false) {
+            Button { model.selectNeighbour(.up) } label: { Label("North", systemImage: "arrow.up") }
+                .help("Select the next intersection above (⌘↑)")
+                .disabled(model.selection == nil)
+        }
+        item("nextRow", shown: false) {
+            Button { model.selectNeighbour(.down) } label: { Label("South", systemImage: "arrow.down") }
+                .help("Select the next intersection below (⌘↓)")
+                .disabled(model.selection == nil)
+        }
+    }
+
+    @ToolbarContentBuilder
+    private var viewItems: some CustomizableToolbarContent {
+        item("zoomOut", shown: false) {
+            Button { model.zoom(by: 1 / 1.5) } label: { Label("Zoom Out", systemImage: "minus.magnifyingglass") }
+                .help("Zoom out (⌘−)")
+                .disabled(model.image == nil)
+        }
+        item("zoomIn", shown: false) {
+            Button { model.zoom(by: 1.5) } label: { Label("Zoom In", systemImage: "plus.magnifyingglass") }
+                .help("Zoom in (⌘+)")
+                .disabled(model.image == nil)
+        }
+        item("actualSize", shown: false) {
+            Button { model.zoom(by: 0) } label: { Label("Actual Size", systemImage: "1.magnifyingglass") }
+                .help("Show one image pixel per screen point (⌘1)")
+                .disabled(model.image == nil)
+        }
+        item("zoomToFit") {
+            Button { model.fitRequest += 1 } label: {
+                Label("Zoom to Fit", systemImage: "arrow.up.left.and.arrow.down.right")
+            }
+            .help("Show the whole map (⌘0)")
+            .disabled(model.image == nil)
+        }
+        item("zoomToSelection", shown: false) {
+            Button { model.zoomToSelection() } label: { Label("Zoom to Selection", systemImage: "scope") }
+                .help("Centre and zoom in on the selected point (⌘E)")
+                .disabled(model.selection == nil)
+        }
+        item("showLines", shown: false) {
+            Toggle(isOn: $model.showLines) { Label("Lines", systemImage: "squareshape.split.3x3") }
+                .help("Show or hide the detected grid lines")
+        }
+        item("showLabels", shown: false) {
+            Toggle(isOn: $model.showLabels) { Label("Labels", systemImage: "tag") }
+                .help("Show or hide the coordinate labels beside the points")
+        }
+        item("viewMenu") {
             Menu {
                 Toggle("Detected Lines", isOn: $model.showLines)
                 Toggle("Coordinate Labels", isOn: $model.showLabels)
                 Divider()
+                Button("Zoom In") { model.zoom(by: 1.5) }
+                Button("Zoom Out") { model.zoom(by: 1 / 1.5) }
+                Button("Actual Size") { model.zoom(by: 0) }
                 Button("Zoom to Fit") { model.fitRequest += 1 }
                 Button("Zoom to Selection") { model.zoomToSelection() }.disabled(model.selection == nil)
                 Divider()
@@ -122,6 +269,33 @@ struct ContentView: View {
             } label: {
                 Label("View", systemImage: "eye")
             }
+            .help("What is drawn on the map, and zooming")
+        }
+    }
+
+    @ToolbarContentBuilder
+    private var switchItems: some CustomizableToolbarContent {
+        item("magnifier", shown: false) {
+            Toggle(isOn: $loupeEnabled) { Label("Magnifier", systemImage: "magnifyingglass.circle") }
+                .help("Show a magnifier while a point is dragged")
+        }
+        item("snapOnDrop", shown: false) {
+            Toggle(isOn: $snapOnDrop) { Label("Snap", systemImage: "dot.scope") }
+                .help("Snap a dropped point onto the nearest crossing (hold Control to place it freely)")
+        }
+        item("preferences", shown: false) {
+            Group {
+                if #available(macOS 14, *) {
+                    SettingsLink { Label("Preferences", systemImage: "gearshape") }
+                } else {
+                    Button {
+                        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+                    } label: {
+                        Label("Preferences", systemImage: "gearshape")
+                    }
+                }
+            }
+            .help("Magnifier, snapping, review and automation settings (⌘,)")
         }
     }
 }

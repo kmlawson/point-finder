@@ -24,6 +24,7 @@ final class MapCanvasView: NSView {
     private var lastFit = -1
     private var lastReveal = -1
     private var lastFocus = 0
+    private var lastZoom = 0
     weak var model: AppModel?
     var cgImage: CGImage? { image }
 
@@ -95,7 +96,21 @@ final class MapCanvasView: NSView {
             lastFocus = model.focusRequest
             if let p = model.selectedPoint { focus(on: Vec2(p.x, p.y)) }
         }
+        if model.zoomRequest != lastZoom {
+            lastZoom = model.zoomRequest
+            zoom(by: model.zoomFactor)
+        }
         overlay.window?.invalidateCursorRects(for: overlay)
+        overlay.needsDisplay = true
+    }
+
+    /// Zooms about the middle of the view; a factor of 0 shows the image at actual size.
+    func zoom(by factor: Double) {
+        guard image != nil else { return }
+        let wanted = factor > 0 ? scrollView.magnification * CGFloat(factor) : 1
+        let target = min(scrollView.maxMagnification, max(scrollView.minMagnification, wanted))
+        let visible = scrollView.contentView.bounds
+        scrollView.setMagnification(target, centeredAt: NSPoint(x: visible.midX, y: visible.midY))
         overlay.needsDisplay = true
     }
 
